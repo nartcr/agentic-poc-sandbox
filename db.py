@@ -18,8 +18,7 @@ CREATE TABLE IF NOT EXISTS app.daily_trades (
     counterparty_id     VARCHAR(100)        NOT NULL,
     loaded_at           TIMESTAMPTZ         NOT NULL,
     source_file         VARCHAR(500)        NOT NULL,
-    CONSTRAINT pk_daily_trades PRIMARY KEY (trade_id, desk_code, trade_date),
-    CONSTRAINT uq_daily_trades UNIQUE (trade_id, desk_code, trade_date)
+    CONSTRAINT pk_daily_trades PRIMARY KEY (trade_id, desk_code, trade_date)
 );
 """
 
@@ -94,7 +93,13 @@ def get_connection(credentials: dict) -> psycopg2.extensions.connection:
     )
     # LOGIC — default to autocommit=False so the pipeline controls transaction boundaries
     conn.autocommit = False
-    logger.info("Database connection established successfully.")
+
+    # LOGIC — set session timezone to ET per regulatory requirement (BAC-7)
+    with conn.cursor() as cur:
+        cur.execute("SET TimeZone='America/Toronto'")
+    conn.commit()
+
+    logger.info("Database connection established successfully (timezone=America/Toronto).")
     return conn
 
 

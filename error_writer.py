@@ -12,26 +12,30 @@ import pytz
 logger = logging.getLogger(__name__)
 
 
+import re
+
+# LOGIC — filename pattern: {desk_code}_{trade_date}_positions.csv
+_FILENAME_PATTERN = re.compile(
+    r"^(?P<desk_code>.+)_(?P<trade_date>\d{4}-\d{2}-\d{2})_positions\.csv$"
+)
+
+
 def _parse_desk_and_date_from_key(source_file_key: str):
     """
     Extracts desk_code and trade_date string from an S3 key whose basename
     follows the pattern {desk_code}_{trade_date}_positions.csv.
+    Handles multi-segment desk codes (e.g. FX_SPOT).
     Returns (desk_code, trade_date_str).
     """
     # LOGIC: derive basename from the S3 key (last path component)
-    basename = os.path.basename(source_file_key)  # e.g. "EQTY_2026-06-15_positions.csv"
-    # LOGIC: strip the trailing "_positions.csv" suffix
-    stem = basename.replace("_positions.csv", "")  # e.g. "EQTY_2026-06-15"
-    # LOGIC: split on first underscore to get desk_code; remainder is trade_date
-    parts = stem.split("_", 1)
-    if len(parts) != 2:
+    basename = os.path.basename(source_file_key)
+    match = _FILENAME_PATTERN.match(basename)
+    if not match:
         raise ValueError(
             f"Cannot parse desk_code/trade_date from source_file_key: {source_file_key!r}. "
             f"Expected pattern {{desk_code}}_{{trade_date}}_positions.csv."
         )
-    desk_code = parts[0]
-    trade_date_str = parts[1]
-    return desk_code, trade_date_str
+    return match.group("desk_code"), match.group("trade_date")
 
 
 def write_error_file(
