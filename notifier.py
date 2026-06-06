@@ -1,107 +1,100 @@
 import json
 import logging
 import os
-from datetime import datetime
 
-import boto3
 import pytz
-
-from exceptions import NotificationError
+from datetime import datetime
 
 # BOILERPLATE
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# LOGIC — ET timestamp helper used for failure notifications
-def _et_now_iso() -> str:
-    et = pytz.timezone("America/Toronto")
-    return datetime.now(et).isoformat()
+_ET = pytz.timezone("America/Toronto")
 
 
-# LOGIC — safe JSON serializer that converts non-serializable types to None or str
-def _safe_default(obj):
-    if isinstance(obj, float):
-        import math
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    return str(obj)
+def notify_success(report: dict, sns_client) -> None:
+    # LOGIC — publish success notification to SNS success topic
+    topic_arn = os.environ["SNS_TOPIC_ARN_SUCCESS"]
 
+    desk_code = report.get("desk_code", "")
+    trade_date = report.get("trade_date", "")
+    subject = f"Trade Position Load Complete: {desk_code} {trade_date}"
 
-def notify_success(report_dict: dict) -> None:
-    # LOGIC — build the SNS success message payload from report_dict fields
-    topic_arn = os.environ["SNS_TOPIC_ARN"]
-
-    desk_code = report_dict.get("desk_code", "")
-    trade_date = report_dict.get("trade_date", "")
-
+    # LOGIC — build message body per SNS success schema in data contracts
     message_body = {
-        "event": "position_ingestion_success",
+        "event_type": "TRADE_POSITION_LOAD_COMPLETE",
+        "source_file": report.get("source_file", ""),
         "desk_code": desk_code,
         "trade_date": trade_date,
-        "source_file": report_dict.get("source_file", ""),
-        "total_rows": report_dict.get("total_rows"),
-        "rows_loaded": report_dict.get("rows_loaded"),
-        "rows_rejected": report_dict.get("rows_rejected"),
-        "processing_timestamp": report_dict.get("processing_timestamp"),
-        "min_notional": report_dict.get("min_notional"),
-        "max_notional": report_dict.get("max_notional"),
-        "null_rates": report_dict.get("null_rates", {}),
+        "total_rows_received": report.get("total_rows_received"),
+        "rows_loaded": report.get("rows_loaded"),
+        "rows_rejected": report.get("rows_rejected"),
+        "processing_timestamp_et": report.get("processing_timestamp_et", ""),
+        "min_notional_amount": report.get("min_notional_amount"),
+        "max_notional_amount": report.get("max_notional_amount"),
+        "null_rates": report.get("null_rates", {}),
+        "desk_code_counts": report.get("desk_code_counts", {}),
     }
 
-    subject = f"RFDH Position Ingestion SUCCESS: {desk_code} {trade_date}"
+    message_str = json.dumps(message_body)
 
-    # LOGIC — truncate subject to SNS 100-char limit
-    subject = subject[:100]
+    logger.info(
+        "Publishing success notification to SNS topic. desk_code=%s trade_date=%s rows_loaded=%s",
+        desk_code,
+        trade_date,
+        message_body.get("rows_loaded"),
+    )
 
-    try:
-        client = boto3.client("sns")
-        client.publish(
-            TopicArn=topic_arn,
-            Subject=subject,
-            Message=json.dumps(message_body, default=_safe_default),
-            MessageStructure="string",
-        )
-        logger.info(
-            "SNS success notification published for desk_code=%s trade_date=%s",
-            desk_code,
-            trade_date,
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to publish SNS success notification: %s", str(exc), exc_info=True
-        )
-        raise NotificationError(f"SNS publish failed: {exc}") from exc
+    # LOGIC — publish to SNS; let boto3 exceptions propagate to orchestrator
+    response = sns_client.publish(
+        TopicArn=topic_arn,
+        Message=message_str,
+        Subject=subject[:100],  # SNS subject max 100 chars
+    )
+
+    logger.info(
+        "Success SNS message published. MessageId=%s",
+        response.get("MessageId"),
+    )
 
 
-def notify_failure(source_file: str, error: str) -> None:
-    # LOGIC — build the SNS failure message payload
-    topic_arn = os.environ["SNS_TOPIC_ARN"]
+def notify_failure(
+    file_name: str,
+    error_message: str,
+    error_type: str,
+    processing_timestamp_et: str,
+    sns_client,
+) -> None:
+    # LOGIC — publish failure notification to SNS failure topic
+    topic_arn = os.environ["SNS_TOPIC_ARN_FAILURE"]
 
+    subject = f"Trade Position Load FAILED: {file_name}"
+
+    # LOGIC — build message body per SNS failure schema in data contracts
     message_body = {
-        "event": "position_ingestion_failure",
-        "source_file": source_file,
-        "error": error,
-        "processing_timestamp": _et_now_iso(),
+        "event_type": "TRADE_POSITION_LOAD_FAILED",
+        "file_name": file_name,
+        "error_type": error_type,
+        "error_message": error_message,
+        "processing_timestamp_et": processing_timestamp_et,
     }
 
-    subject = f"RFDH Position Ingestion FAILURE: {source_file}"
-    subject = subject[:100]
+    message_str = json.dumps(message_body)
 
-    try:
-        client = boto3.client("sns")
-        client.publish(
-            TopicArn=topic_arn,
-            Subject=subject,
-            Message=json.dumps(message_body, default=_safe_default),
-            MessageStructure="string",
-        )
-        logger.info(
-            "SNS failure notification published for source_file=%s", source_file
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to publish SNS failure notification: %s", str(exc), exc_info=True
-        )
-        raise NotificationError(f"SNS publish failed: {exc}") from exc
+    logger.info(
+        "Publishing failure notification to SNS topic. file_name=%s error_type=%s",
+        file_name,
+        error_type,
+    )
+
+    # LOGIC — publish to SNS; let boto3 exceptions propagate to orchestrator
+    response = sns_client.publish(
+        TopicArn=topic_arn,
+        Message=message_str,
+        Subject=subject[:100],  # SNS subject max 100 chars
+    )
+
+    logger.info(
+        "Failure SNS message published. MessageId=%s",
+        response.get("MessageId"),
+    )
