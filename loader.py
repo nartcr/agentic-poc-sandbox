@@ -1,130 +1,137 @@
 # BOILERPLATE
 import logging
-import os
-from datetime import datetime
+import datetime
+from decimal import Decimal, InvalidOperation
 
+import pandas as pd
 import psycopg2
 import psycopg2.extras
-import pytz
-
-import exceptions
-import secrets as secrets_module
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-ET = pytz.timezone("America/Toronto")
 
-# LOGIC
-def load_positions(valid_df, source_file: str) -> int:
+def load_records(valid_df: pd.DataFrame, source_file: str, secrets: dict) -> int:
     """
-    Inserts validated trade positions into rfdh.trade_positions.
+    Bulk-insert validated trade records into rfdh.daily_trades.
     Uses ON CONFLICT (trade_id, desk_code, trade_date) DO NOTHING for idempotency.
-    Returns the count of rows actually inserted (not skipped).
+    Returns the number of rows actually inserted (duplicates are silently skipped).
+    Rolls back and re-raises on any error.
     """
-    if valid_df is None or len(valid_df) == 0:
-        logger.info("load_positions called with empty DataFrame; skipping insert.")
+    # LOGIC
+    if valid_df.empty:
+        logger.info("load_records: valid_df is empty, nothing to insert.")
         return 0
 
-    # LOGIC — retrieve credentials at runtime, never hardcoded
-    try:
-        creds = secrets_module.get_db_credentials()
-    except Exception as exc:
-        logger.error("Failed to retrieve DB credentials: %s", exc)
-        raise exceptions.LoadError(f"Credential retrieval failed: {exc}") from exc
-
-    # LOGIC — compute ET timestamp for loaded_at
-    loaded_at = datetime.now(tz=ET)
+    # LOGIC — build list of tuples with correct types for psycopg2
+    records = _build_records(valid_df, source_file)
 
     conn = None
-    cursor = None
     try:
-        # BOILERPLATE — establish connection
+        # BOILERPLATE — connect to Aurora PostgreSQL
         conn = psycopg2.connect(
-            host=creds["host"],
-            port=int(creds["port"]),
-            dbname=creds["dbname"],
-            user=creds["username"],
-            password=creds["password"],
+            host=secrets["host"],
+            port=int(secrets["port"]),
+            dbname=secrets["dbname"],
+            user=secrets["username"],
+            password=secrets["password"],
         )
-        cursor = conn.cursor()
+        conn.autocommit = False
 
-        # LOGIC — capture pre-insert count for the rows in valid_df
-        # to compute net inserted count reliably with ON CONFLICT DO NOTHING
-        trade_keys = [
-            (str(row["trade_id"]), str(row["desk_code"]), row["trade_date"])
-            for _, row in valid_df.iterrows()
-        ]
-
-        # LOGIC — count how many of the incoming (trade_id, desk_code, trade_date)
-        # tuples already exist in the table
-        cursor.execute(
+        with conn.cursor() as cur:
+            # LOGIC — bulk insert with conflict handling
+            insert_sql = """
+                INSERT INTO rfdh.daily_trades (
+                    trade_id,
+                    desk_code,
+                    trade_date,
+                    instrument_type,
+                    notional_amount,
+                    currency,
+                    counterparty_id,
+                    source_file
+                )
+                VALUES %s
+                ON CONFLICT (trade_id, desk_code, trade_date) DO NOTHING
             """
-            SELECT COUNT(*)
-            FROM rfdh.trade_positions
-            WHERE (trade_id, desk_code, trade_date) IN %s
-            """,
-            (tuple(trade_keys),),
-        )
-        pre_existing_count = cursor.fetchone()[0]
 
-        # LOGIC — build the rows tuple for batch insert
-        rows = [
-            (
-                str(row["trade_id"]),
-                str(row["desk_code"]),
-                row["trade_date"],             # datetime.date from validator
-                str(row["instrument_type"]),
-                float(row["notional_amount"]), # float64 from validator
-                str(row["currency"]),
-                str(row["counterparty_id"]),
-                loaded_at,
+            psycopg2.extras.execute_values(
+                cur,
+                insert_sql,
+                records,
+                template=None,
+                page_size=1000,
+            )
+
+            # LOGIC — rowcount reflects only rows actually inserted (DO NOTHING rows excluded)
+            rows_inserted = cur.rowcount
+            logger.info(
+                "load_records: submitted=%d, inserted=%d, duplicates_skipped=%d, source_file=%s",
+                len(records),
+                rows_inserted,
+                len(records) - rows_inserted,
                 source_file,
             )
-            for _, row in valid_df.iterrows()
-        ]
 
-        # LOGIC — idempotent batch insert
-        insert_sql = """
-            INSERT INTO rfdh.trade_positions
-              (trade_id, desk_code, trade_date, instrument_type, notional_amount,
-               currency, counterparty_id, loaded_at, source_file)
-            VALUES %s
-            ON CONFLICT (trade_id, desk_code, trade_date) DO NOTHING
-        """
-        psycopg2.extras.execute_values(cursor, insert_sql, rows, page_size=500)
         conn.commit()
+        logger.info("load_records: transaction committed successfully.")
+        return rows_inserted
 
-        # LOGIC — net inserted = total attempted minus pre-existing duplicates
-        inserted_count = len(rows) - pre_existing_count
-        logger.info(
-            "load_positions: attempted=%d, pre_existing=%d, inserted=%d, source_file=%s",
-            len(rows),
-            pre_existing_count,
-            inserted_count,
-            source_file,
-        )
-        return inserted_count
-
-    except exceptions.LoadError:
-        raise
-    except Exception as exc:
-        logger.error("DB insert failed, rolling back: %s", exc)
+    except Exception:
+        logger.exception("load_records: error during bulk insert — rolling back transaction.")
         if conn is not None:
             try:
                 conn.rollback()
-            except Exception as rb_exc:
-                logger.error("Rollback also failed: %s", rb_exc)
-        raise exceptions.LoadError(f"DB insert failed: {exc}") from exc
-    finally:
-        # BOILERPLATE — always close resources
-        if cursor is not None:
-            try:
-                cursor.close()
+                logger.info("load_records: rollback completed.")
             except Exception:
-                pass
+                logger.exception("load_records: rollback also failed.")
+        raise
+
+    finally:
+        # BOILERPLATE — always close connection
         if conn is not None:
             try:
                 conn.close()
             except Exception:
-                pass
+                logger.exception("load_records: failed to close database connection.")
+
+
+def _build_records(valid_df: pd.DataFrame, source_file: str) -> list:
+    """
+    Convert each row of valid_df into a tuple matching the INSERT column order.
+    Casts notional_amount to Decimal and trade_date to datetime.date.
+    Raises ValueError if any cast fails (should not happen post-validation, but defensive).
+    """
+    # BOILERPLATE
+    records = []
+
+    for idx, row in valid_df.iterrows():
+        # LOGIC — cast notional_amount string to Decimal
+        try:
+            notional = Decimal(str(row["notional_amount"]).strip())
+        except InvalidOperation as exc:
+            raise ValueError(
+                f"Row index {idx}: cannot cast notional_amount "
+                f"'{row['notional_amount']}' to Decimal."
+            ) from exc
+
+        # LOGIC — cast trade_date string to datetime.date
+        try:
+            trade_date = datetime.date.fromisoformat(str(row["trade_date"]).strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Row index {idx}: cannot cast trade_date "
+                f"'{row['trade_date']}' to date."
+            ) from exc
+
+        records.append((
+            str(row["trade_id"]).strip(),
+            str(row["desk_code"]).strip(),
+            trade_date,
+            str(row["instrument_type"]).strip(),
+            notional,
+            str(row["currency"]).strip(),
+            str(row["counterparty_id"]).strip(),
+            source_file,
+        ))
+
+    return records

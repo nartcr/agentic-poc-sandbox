@@ -4,120 +4,171 @@ import os
 from datetime import datetime
 
 import psycopg2
-import psycopg2.extras
 import pytz
 
-from exceptions import SecretsError
-from secrets import get_db_credentials
-
-# BOILERPLATE
 logger = logging.getLogger(__name__)
 
-# LOGIC — allowed outcome values per design contract
-_VALID_OUTCOMES = frozenset({"SUCCESS", "PARTIAL", "FAILURE"})
+# LOGIC — required keys that must be present in the secrets dict
+_REQUIRED_SECRET_KEYS = {"host", "port", "dbname", "username", "password"}
 
-# BOILERPLATE — ET timezone constant
-_ET = pytz.timezone("America/Toronto")
+ET = pytz.timezone("America/Toronto")
 
 
-def record(
-    source_file: str,
-    outcome: str,
-    total_rows: int,
-    rows_loaded: int,
-    rows_rejected: int,
-    processing_timestamp: datetime,
-) -> None:
-    """
-    Write a single audit row to rfdh.ingestion_audit.
-
-    This insert is intentionally NOT idempotent — each processing run,
-    including retries, produces its own audit row (per design).
-
-    Parameters
-    ----------
-    source_file            : S3 object key of the processed file.
-    outcome                : One of 'SUCCESS', 'PARTIAL', 'FAILURE'.
-    total_rows             : Total rows read from the input file.
-    rows_loaded            : Rows actually inserted into rfdh.trade_positions.
-    rows_rejected          : Rows rejected by validation.
-    processing_timestamp   : ET-aware datetime representing when processing occurred.
-    """
-    # LOGIC — guard invalid outcome values before touching the database
-    if outcome not in _VALID_OUTCOMES:
-        raise ValueError(
-            f"Invalid outcome '{outcome}'. Must be one of: {sorted(_VALID_OUTCOMES)}"
+def _build_connection(secrets: dict):
+    # LOGIC — validate secrets dict before attempting connection
+    missing = _REQUIRED_SECRET_KEYS - secrets.keys()
+    if missing:
+        raise RuntimeError(
+            f"Secrets dict is missing required keys: {sorted(missing)}"
         )
+    return psycopg2.connect(
+        host=secrets["host"],
+        port=int(secrets["port"]),
+        dbname=secrets["dbname"],
+        user=secrets["username"],
+        password=secrets["password"],
+    )
 
-    # LOGIC — ensure processing_timestamp is ET-aware; localize naive datetimes
-    if processing_timestamp.tzinfo is None:
-        logger.warning(
-            "processing_timestamp has no tzinfo; localizing to ET as a precaution."
+
+def start_audit(file_name: str, source_file_key: str, secrets: dict) -> int:
+    """
+    Insert an IN_PROGRESS row into rfdh.audit_log.
+    Returns the generated audit_id (serial PK).
+    Satisfies: BAC-7, BAC-8
+    """
+    # LOGIC — capture ET timestamp at the moment the pipeline starts
+    started_at_et = datetime.now(ET).isoformat()
+    service_identity = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "unknown")
+
+    # LOGIC — INSERT with RETURNING to retrieve the generated audit_id
+    sql = """
+        INSERT INTO rfdh.audit_log (
+            file_name,
+            source_file_key,
+            status,
+            rows_received,
+            rows_loaded,
+            rows_rejected,
+            error_message,
+            started_at_et,
+            completed_at_et,
+            service_identity
         )
-        processing_timestamp = _ET.localize(processing_timestamp)
-
-    # LOGIC — read service identity from environment (injected at deploy time, never hardcoded)
-    service_identity = os.environ["SERVICE_IDENTITY"]
-
-    # LOGIC — retrieve DB credentials from Secrets Manager (via cached helper)
-    try:
-        creds = get_db_credentials()
-    except SecretsError as exc:
-        logger.error("Cannot write audit record — credential retrieval failed: %s", exc)
-        raise
-
-    # BOILERPLATE — build connection parameters from secret payload
-    conn_params = {
-        "host": creds["host"],
-        "port": int(creds["port"]),
-        "dbname": creds["dbname"],
-        "user": creds["username"],
-        "password": creds["password"],
-    }
-
-    # LOGIC — SQL insert; deliberately no ON CONFLICT clause (non-idempotent by design)
-    insert_sql = """
-        INSERT INTO rfdh.ingestion_audit
-            (source_file, outcome, total_rows, rows_loaded, rows_rejected,
-             processing_timestamp, service_identity)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING audit_id
     """
 
     conn = None
     try:
-        conn = psycopg2.connect(**conn_params)  # BOILERPLATE
-        with conn:  # BOILERPLATE — context manager commits on exit, rolls back on exception
+        conn = _build_connection(secrets)
+        with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    insert_sql,
+                    sql,
                     (
-                        source_file,
-                        outcome,
-                        int(total_rows),
-                        int(rows_loaded),
-                        int(rows_rejected),
-                        processing_timestamp,  # LOGIC — psycopg2 serialises tz-aware datetime as TIMESTAMPTZ
-                        service_identity,
+                        file_name,          # file_name
+                        source_file_key,    # source_file_key
+                        "IN_PROGRESS",      # status
+                        None,               # rows_received — unknown at start
+                        None,               # rows_loaded   — unknown at start
+                        None,               # rows_rejected — unknown at start
+                        None,               # error_message — none at start
+                        started_at_et,      # started_at_et (ET ISO 8601)
+                        None,               # completed_at_et — not yet complete
+                        service_identity,   # service_identity (Lambda fn name)
                     ),
                 )
-                logger.info(
-                    "Audit record written: source_file=%s outcome=%s "
-                    "total_rows=%d rows_loaded=%d rows_rejected=%d",
-                    source_file,
-                    outcome,
-                    total_rows,
-                    rows_loaded,
-                    rows_rejected,
-                )
-    except psycopg2.Error as exc:
-        logger.error(
-            "Failed to write audit record for source_file='%s': %s",
-            source_file,
-            exc,
+                row = cur.fetchone()
+                audit_id = row[0]
+
+        logger.info(
+            "Audit started: audit_id=%s file_name=%s started_at_et=%s",
+            audit_id,
+            file_name,
+            started_at_et,
+        )
+        return audit_id
+
+    except Exception:
+        logger.exception(
+            "Failed to insert audit row for file_name=%s", file_name
         )
         raise
     finally:
-        # BOILERPLATE — always close connection; psycopg2 context manager handles
-        # commit/rollback but does not close the connection itself
+        if conn is not None:
+            conn.close()
+
+
+def complete_audit(
+    audit_id: int,
+    status: str,
+    rows_received: int,
+    rows_loaded: int,
+    rows_rejected: int,
+    error_message: str | None,
+    secrets: dict,
+) -> None:
+    """
+    Update the rfdh.audit_log row identified by audit_id with final
+    status, row counts, completion timestamp, and optional error message.
+    Satisfies: BAC-7, BAC-8
+    """
+    # LOGIC — capture ET timestamp at the moment the pipeline completes
+    completed_at_et = datetime.now(ET).isoformat()
+
+    # LOGIC — UPDATE the existing audit row; all nullable columns are now known
+    sql = """
+        UPDATE rfdh.audit_log
+        SET
+            status           = %s,
+            rows_received    = %s,
+            rows_loaded      = %s,
+            rows_rejected    = %s,
+            error_message    = %s,
+            completed_at_et  = %s
+        WHERE audit_id = %s
+    """
+
+    conn = None
+    try:
+        conn = _build_connection(secrets)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        status,           # 'SUCCESS' or 'FAILURE'
+                        rows_received,
+                        rows_loaded,
+                        rows_rejected,
+                        error_message,    # None if successful
+                        completed_at_et,  # ET ISO 8601
+                        audit_id,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    logger.warning(
+                        "complete_audit: no row updated for audit_id=%s "
+                        "(row may not exist)",
+                        audit_id,
+                    )
+
+        logger.info(
+            "Audit completed: audit_id=%s status=%s rows_received=%s "
+            "rows_loaded=%s rows_rejected=%s completed_at_et=%s",
+            audit_id,
+            status,
+            rows_received,
+            rows_loaded,
+            rows_rejected,
+            completed_at_et,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to update audit row for audit_id=%s", audit_id
+        )
+        raise
+    finally:
         if conn is not None:
             conn.close()
