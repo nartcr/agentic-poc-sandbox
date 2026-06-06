@@ -1,189 +1,195 @@
-# BOILERPLATE
-import io
 import logging
 import os
-import re
-from datetime import datetime
+import uuid
 
-import pandas as pd
+import boto3
 import pytz
+from datetime import datetime
+from sqlalchemy import create_engine
 
-from src.audit import write_audit_record
-from src.config import Config
-from src.error_writer import write_error_file
-from src.loader import load_positions
-from src.notifier import notify_failure, notify_success
-from src.reporter import build_and_upload_report
-from src.s3_client import download_fileobj
-from src.secrets import get_db_credentials
-from src.validator import validate_rows
+from src import (
+    audit,
+    error_writer,
+    file_reader,
+    loader,
+    notifier,
+    reporter,
+    validator,
+)
+from src.config import (
+    DB_NAME,
+    DB_SECRET_ID,
+    S3_BUCKET,
+    SNS_FAILURE_TOPIC_ARN,
+    SNS_SUCCESS_TOPIC_ARN,
+)
+from src.secrets import get_db_connection_string
 
 # BOILERPLATE
 logger = logging.getLogger(__name__)
 
-# LOGIC — filename convention regex from design
-_FILENAME_RE = re.compile(r"^([A-Z0-9]+)_(\d{4}-\d{2}-\d{2})_positions\.csv$")
-
-# BOILERPLATE
-_ET_TZ = pytz.timezone("America/Toronto")
+_ET = pytz.timezone("America/Toronto")
 
 
-def _parse_filename(s3_key: str) -> tuple[str, str]:
-    # LOGIC — extract just the filename component from the full S3 key
-    filename = os.path.basename(s3_key)
-    match = _FILENAME_RE.match(filename)
-    if not match:
-        raise ValueError(
-            f"S3 key '{s3_key}' does not match expected filename convention "
-            r"^([A-Z0-9]+)_(\d{4}-\d{2}-\d{2})_positions\.csv$"
-        )
-    desk_code = match.group(1)
-    trade_date = match.group(2)
-    return desk_code, trade_date
+def run_pipeline(s3_key: str) -> dict:
+    # BOILERPLATE — capture processing timestamp in ET at the very start.
+    processing_ts: datetime = datetime.now(_ET)
+    run_id = uuid.uuid4()
 
+    # BOILERPLATE — boto3 clients; region read from AWS_REGION env var by boto3 automatically.
+    s3_client = boto3.client("s3")
+    sns_client = boto3.client("sns")
 
-def _determine_outcome(loaded_rows: int, rejected_rows: int) -> str:
-    # LOGIC — outcome rules from design:
-    # SUCCESS  : loaded > 0 and no rejections  OR  valid_df is empty (nothing to load) and no rejections
-    # PARTIAL  : loaded > 0 AND rejected > 0
-    # Note: FAILURE is only set on exception — this function is only reached on non-exception path
-    if loaded_rows > 0 and rejected_rows > 0:
-        return "PARTIAL"
-    return "SUCCESS"
+    # LOGIC — pre-declare metadata so the except block can reference them even if
+    # extraction fails before they are assigned.
+    desk_code: str = "UNKNOWN"
+    trade_date: str = "UNKNOWN"
 
-
-def process_file(s3_key: str, config: Config) -> None:
-    # BOILERPLATE — capture processing timestamp in ET at the start of this file's run
-    processing_timestamp: datetime = datetime.now(tz=_ET_TZ)
-
-    # LOGIC — step 1: parse desk_code and trade_date from filename
-    desk_code, trade_date = _parse_filename(s3_key)
-    logger.info(
-        "Starting processing: s3_key=%s desk_code=%s trade_date=%s",
-        s3_key,
-        desk_code,
-        trade_date,
-    )
-
-    # BOILERPLATE — fetch DB credentials once; reused across loader and audit
-    credentials: dict = get_db_credentials(config.db_secret_id)
+    # LOGIC — read SERVICE_IDENTITY from environment for audit trail.
+    service_identity: str = os.environ["SERVICE_IDENTITY"]
 
     try:
-        # LOGIC — step 2: download file bytes from S3
-        file_obj: io.BytesIO = download_fileobj(config.s3_bucket, s3_key)
+        # BOILERPLATE — database engine created once for the whole pipeline run.
+        connection_string = get_db_connection_string(DB_SECRET_ID, DB_NAME)
+        engine = create_engine(connection_string, future=True)
 
-        # LOGIC — step 3: parse CSV into DataFrame; raise on parse failure
-        try:
-            raw_bytes: bytes = file_obj.read()
-            csv_text: str = raw_bytes.decode("utf-8")
-            df: pd.DataFrame = pd.read_csv(io.StringIO(csv_text), dtype=str)
-        except Exception as parse_exc:
-            raise ValueError(
-                f"Failed to parse CSV for s3_key={s3_key}: {parse_exc}"
-            ) from parse_exc
+        # Step 5 — extract metadata from S3 key.
+        desk_code, trade_date = file_reader.extract_metadata_from_key(s3_key)
+        logger.info(
+            "Pipeline start: run_id=%s s3_key=%s desk_code=%s trade_date=%s",
+            run_id,
+            s3_key,
+            desk_code,
+            trade_date,
+        )
 
-        total_rows: int = len(df)
-        logger.info("Parsed CSV: s3_key=%s total_rows=%d", s3_key, total_rows)
+        # Step 6 — download and parse CSV.
+        raw_df, total_rows = file_reader.download_and_parse(s3_client, S3_BUCKET, s3_key)
+        logger.info("File parsed: total_rows=%d s3_key=%s", total_rows, s3_key)
 
-        # LOGIC — step 4: validate rows
-        valid_df: pd.DataFrame
-        rejected_df: pd.DataFrame
-        valid_df, rejected_df = validate_rows(df, desk_code, trade_date)
+        # Step 7 — validate rows.
+        valid_df, rejected_df = validator.validate(raw_df, desk_code, trade_date)
         logger.info(
             "Validation complete: valid=%d rejected=%d",
             len(valid_df),
             len(rejected_df),
         )
+        if len(rejected_df) > 0:
+            logger.warning(
+                "Rejected rows detected: count=%d desk_code=%s trade_date=%s",
+                len(rejected_df),
+                desk_code,
+                trade_date,
+            )
 
-        # LOGIC — step 5: load valid rows into Aurora
-        loaded_count: int = load_positions(valid_df, credentials)
+        # Step 8 — write error file if there are rejected rows.
+        error_s3_key = error_writer.write_error_file(
+            s3_client, S3_BUCKET, rejected_df, desk_code, trade_date, processing_ts
+        )
+        if error_s3_key:
+            logger.info("Error file written: %s", error_s3_key)
+
+        # Step 9 — load valid positions into the database.
+        rows_inserted = loader.load_positions(engine, valid_df, processing_ts)
+        rows_skipped_duplicate = len(valid_df) - rows_inserted
         logger.info(
-            "Load complete: loaded=%d attempted=%d",
-            loaded_count,
-            len(valid_df),
+            "Load complete: rows_inserted=%d rows_skipped_duplicate=%d",
+            rows_inserted,
+            rows_skipped_duplicate,
         )
 
-        # LOGIC — step 6: write error file only when there are rejected rows
-        if len(rejected_df) > 0:
-            error_key: str = write_error_file(
-                rejected_df, desk_code, trade_date, config.s3_bucket
-            )
-            logger.info("Error file written: s3_key=%s", error_key)
-
-        # LOGIC — step 7: build and upload summary report
-        report: dict = build_and_upload_report(
-            source_key=s3_key,
-            total_rows=total_rows,
-            loaded_rows=loaded_count,
-            rejected_rows=len(rejected_df),
+        # Step 10 — build the summary report dict.
+        report = reporter.build_report(
+            raw_df=raw_df,
             valid_df=valid_df,
             rejected_df=rejected_df,
-            processing_timestamp=processing_timestamp,
-            bucket=config.s3_bucket,
-        )
-        logger.info("Report uploaded for s3_key=%s", s3_key)
-
-        # LOGIC — step 8: determine outcome and write audit record
-        outcome: str = _determine_outcome(loaded_count, len(rejected_df))
-        write_audit_record(
-            credentials=credentials,
-            source_key=s3_key,
+            rows_inserted=rows_inserted,
             desk_code=desk_code,
             trade_date=trade_date,
-            outcome=outcome,
-            total_rows=total_rows,
-            loaded_rows=loaded_count,
-            rejected_rows=len(rejected_df),
-            error_detail=None,
-            processed_at=processing_timestamp,
+            processing_ts=processing_ts,
+            error_s3_key=error_s3_key,
         )
+
+        # Step 11 — write JSON report to S3.
+        report_s3_key = reporter.write_report(
+            s3_client, S3_BUCKET, report, desk_code, trade_date, processing_ts
+        )
+        logger.info("Report written: %s", report_s3_key)
+
+        # Step 12 — write audit record.
+        audit_row = {
+            "run_id": str(run_id),
+            "s3_key": s3_key,
+            "desk_code": desk_code,
+            "trade_date": trade_date,
+            "processing_timestamp": processing_ts,
+            "status": report["status"],
+            "total_rows": total_rows,
+            "rows_inserted": rows_inserted,
+            "rows_rejected": len(rejected_df),
+            "rows_skipped_duplicate": rows_skipped_duplicate,
+            "report_s3_key": report_s3_key,
+            "error_s3_key": error_s3_key,
+            "service_identity": service_identity,
+        }
+        audit.write_audit_record(engine, audit_row)
+
+        # Step 13 — notify downstream systems of success.
+        report["report_s3_key"] = report_s3_key
+        notifier.notify_success(sns_client, SNS_SUCCESS_TOPIC_ARN, report)
         logger.info(
-            "Audit record written: s3_key=%s outcome=%s", s3_key, outcome
+            "Pipeline complete: run_id=%s status=%s", run_id, report["status"]
         )
 
-        # LOGIC — step 9: notify success
-        notify_success(report, config.sns_success_arn)
-        logger.info("Success notification sent for s3_key=%s", s3_key)
+        return report
 
-    except Exception as exc:
-        # LOGIC — step 10: failure path — audit + notify, then re-raise
+    except Exception as exc:  # LOGIC — catch-all for unhandled pipeline exceptions.
         logger.error(
-            "Processing failed for s3_key=%s: %s", s3_key, exc, exc_info=True
+            "Pipeline failed: run_id=%s s3_key=%s error=%s",
+            run_id,
+            s3_key,
+            str(exc),
+            exc_info=True,
         )
 
-        # LOGIC — sanitise error message: do not include credential values
-        sanitised_error: str = str(exc)
-
-        # LOGIC — attempt to write FAILURE audit record; swallow secondary errors
+        # LOGIC — attempt failure notification; log but do not suppress secondary errors.
         try:
-            write_audit_record(
-                credentials=credentials,
-                source_key=s3_key,
-                desk_code=desk_code,
-                trade_date=trade_date,
-                outcome="FAILURE",
-                total_rows=0,
-                loaded_rows=0,
-                rejected_rows=0,
-                error_detail=sanitised_error,
-                processed_at=processing_timestamp,
+            notifier.notify_failure(
+                sns_client,
+                SNS_FAILURE_TOPIC_ARN,
+                desk_code,
+                trade_date,
+                str(exc),
+                processing_ts,
             )
-        except Exception as audit_exc:
-            logger.error(
-                "Could not write FAILURE audit record for s3_key=%s: %s",
-                s3_key,
-                audit_exc,
-            )
-
-        # LOGIC — attempt failure SNS notification; swallow secondary errors
-        try:
-            notify_failure(s3_key, sanitised_error, config.sns_failure_arn)
         except Exception as notify_exc:
             logger.error(
-                "Could not send failure notification for s3_key=%s: %s",
-                s3_key,
-                notify_exc,
+                "Failed to send failure notification: %s", str(notify_exc), exc_info=True
             )
 
-        # LOGIC — re-raise original exception so main() can track failure count
+        # LOGIC — attempt to write ERROR audit record; log but do not suppress.
+        try:
+            error_audit_row = {
+                "run_id": str(run_id),
+                "s3_key": s3_key,
+                "desk_code": desk_code,
+                "trade_date": trade_date,
+                "processing_timestamp": processing_ts,
+                "status": "ERROR",
+                "total_rows": 0,
+                "rows_inserted": 0,
+                "rows_rejected": 0,
+                "rows_skipped_duplicate": 0,
+                "report_s3_key": None,
+                "error_s3_key": None,
+                "service_identity": service_identity,
+            }
+            # LOGIC — engine may not exist if connection setup failed; guard accordingly.
+            if "engine" in dir():
+                audit.write_audit_record(engine, error_audit_row)
+        except Exception as audit_exc:
+            logger.error(
+                "Failed to write error audit record: %s", str(audit_exc), exc_info=True
+            )
+
         raise

@@ -1,89 +1,88 @@
 # BOILERPLATE
 import logging
 from datetime import datetime
+from itertools import islice
 
 import pandas as pd
-import psycopg2
-import psycopg2.extras
-import pytz
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
-# LOGIC
-_ET = pytz.timezone("America/Toronto")
-
-_INSERT_SQL = """
-INSERT INTO demo_schema.trade_positions
-    (trade_id, desk_code, trade_date, instrument_type,
-     notional_amount, currency, counterparty_id, loaded_at)
-VALUES %s
-ON CONFLICT (trade_id, desk_code, trade_date) DO NOTHING
-"""
+# LOGIC: Maximum rows per INSERT batch to stay within DB parameterisation limits
+_BATCH_SIZE = 1000
 
 
-def load_positions(valid_df: pd.DataFrame, credentials: dict) -> int:
-    # LOGIC — build row tuples and bulk-insert with conflict handling
-    if valid_df.empty:
-        logger.info("load_positions called with empty DataFrame; skipping insert.")
-        return 0
+def _iter_batches(df: pd.DataFrame, batch_size: int):
+    # LOGIC: Yield successive DataFrame slices of up to batch_size rows
+    start = 0
+    total = len(df)
+    while start < total:
+        yield df.iloc[start : start + batch_size]
+        start += batch_size
 
-    loaded_at = datetime.now(tz=_ET)
 
-    rows = [
-        (
-            row["trade_id"],
-            row["desk_code"],
-            row["trade_date"],
-            row["instrument_type"],
-            row["notional_amount"],
-            row["currency"],
-            row["counterparty_id"],
-            loaded_at,
-        )
-        for _, row in valid_df.iterrows()
-    ]
+def load_positions(engine, valid_df: pd.DataFrame, processing_ts: datetime) -> int:
+    # LOGIC: Attach loaded_at column (ET-aware processing timestamp) to a working copy
+    df = valid_df.copy()
+    df["loaded_at"] = processing_ts
 
-    conn = None
-    try:
-        # BOILERPLATE — open connection using credentials from Secrets Manager
-        conn = psycopg2.connect(
-            host=credentials["host"],
-            port=int(credentials["port"]),
-            user=credentials["username"],
-            password=credentials["password"],
-            dbname=credentials["dbname"],
-        )
-        with conn:
-            with conn.cursor() as cursor:
-                # LOGIC — execute_values performs a single multi-row INSERT
-                psycopg2.extras.execute_values(
-                    cursor,
-                    _INSERT_SQL,
-                    rows,
-                    template=None,
-                    page_size=1000,
-                )
-                # LOGIC — rowcount reflects rows actually inserted (conflicts excluded)
-                inserted_count = cursor.rowcount
+    # BOILERPLATE: SQL for idempotent upsert — ON CONFLICT skips pre-existing rows
+    insert_sql = text(
+        """
+        INSERT INTO demo_schema.trade_positions
+            (trade_id, desk_code, trade_date, instrument_type,
+             notional_amount, currency, counterparty_id, loaded_at)
+        VALUES
+            (:trade_id, :desk_code, :trade_date, :instrument_type,
+             :notional_amount, :currency, :counterparty_id, :loaded_at)
+        ON CONFLICT (trade_id, desk_code, trade_date) DO NOTHING
+        """
+    )
+
+    total_inserted = 0
+
+    # LOGIC: Execute inside a single transaction; rollback on any exception
+    with engine.begin() as conn:
+        try:
+            for batch_df in _iter_batches(df, _BATCH_SIZE):
+                # LOGIC: Convert each batch to list-of-dicts for SQLAlchemy named params
+                rows = []
+                for _, row in batch_df.iterrows():
+                    rows.append(
+                        {
+                            "trade_id": str(row["trade_id"]),
+                            "desk_code": str(row["desk_code"]),
+                            "trade_date": row["trade_date"],
+                            "instrument_type": str(row["instrument_type"]),
+                            "notional_amount": float(row["notional_amount"]),
+                            "currency": str(row["currency"]),
+                            "counterparty_id": str(row["counterparty_id"]),
+                            "loaded_at": row["loaded_at"],
+                        }
+                    )
+
+                # LOGIC: Execute batch; rowcount reflects only actually inserted rows
+                result = conn.execute(insert_sql, rows)
+                batch_inserted = result.rowcount if result.rowcount >= 0 else 0
+                total_inserted += batch_inserted
+
                 logger.info(
-                    "load_positions: attempted=%d inserted=%d",
+                    "Batch of %d rows processed; %d inserted (cumulative: %d)",
                     len(rows),
-                    inserted_count,
+                    batch_inserted,
+                    total_inserted,
                 )
-        return inserted_count
 
-    except psycopg2.Error as exc:
-        # LOGIC — sanitise: do not log credential values
-        logger.error(
-            "Database error during load_positions: %s",
-            type(exc).__name__,
-        )
-        raise RuntimeError(
-            f"Failed to insert rows into demo_schema.trade_positions: {type(exc).__name__}"
-        ) from exc
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:
+            logger.error(
+                "Error during load_positions — transaction will be rolled back",
+                exc_info=True,
+            )
+            raise
+
+    logger.info(
+        "load_positions complete: %d total rows inserted into demo_schema.trade_positions",
+        total_inserted,
+    )
+
+    return total_inserted

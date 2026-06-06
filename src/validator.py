@@ -1,123 +1,159 @@
 # BOILERPLATE
+import datetime
 import logging
-import re
-from datetime import datetime
 
 import pandas as pd
 
-# BOILERPLATE — import mandatory field list from config to avoid duplication
+# LOGIC — import mandatory field list from centralised config
 from src.config import MANDATORY_FIELDS
 
 logger = logging.getLogger(__name__)
 
-# LOGIC — compiled regex for ISO 4217 currency shape: exactly 3 uppercase alpha characters
-_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
-
-# LOGIC — strict date format for trade_date validation
-_DATE_FORMAT = "%Y-%m-%d"
+# LOGIC — date format that trade_date values must conform to
+_TRADE_DATE_FORMAT = "%Y-%m-%d"
 
 
-def _is_blank(value) -> bool:
-    # LOGIC — treat NaN, None, and whitespace-only strings as blank
+def _is_blank(value: str) -> bool:
+    """Returns True if the value is None, empty, or whitespace-only."""
+    # LOGIC
     if value is None:
         return True
-    if pd.isna(value):
+    return str(value).strip() == ""
+
+
+def _try_cast_float(value: str) -> bool:
+    """Returns True if value can be cast to float after stripping whitespace."""
+    # LOGIC
+    try:
+        float(str(value).strip())
         return True
-    if isinstance(value, str) and value.strip() == "":
+    except (ValueError, TypeError):
+        return False
+
+
+def _try_cast_date(value: str) -> bool:
+    """Returns True if value matches YYYY-MM-DD format exactly."""
+    # LOGIC
+    try:
+        datetime.datetime.strptime(str(value).strip(), _TRADE_DATE_FORMAT)
         return True
-    return False
+    except (ValueError, TypeError):
+        return False
 
 
-def _check_row(row: pd.Series, desk_code_from_filename: str, trade_date_from_filename: str):
-    # LOGIC — apply V-01 through V-07 in order; return the rejection_reason string
-    # for the first failing rule, or None if the row is fully valid.
+def validate(
+    df: pd.DataFrame, desk_code: str, trade_date: str
+) -> tuple:
+    """
+    Validates each row of the raw DataFrame against field-level rules.
 
-    # V-01: all mandatory fields must be present and non-empty
+    Checks applied in order per row (first failure wins):
+      1. Missing mandatory fields (null / empty / whitespace-only)
+      2. trade_date column value does not match YYYY-MM-DD
+      3. notional_amount cannot be cast to float
+      4. Row's desk_code does not match filename-extracted desk_code
+
+    Returns:
+        (valid_df, rejected_df)
+        - valid_df:    original columns + row_number (int), notional_amount cast
+                       to float, trade_date cast to datetime.date
+        - rejected_df: original columns + row_number (int) + rejection_reason (str)
+    """
+    # BOILERPLATE — work on a copy; do not mutate caller's DataFrame
+    working = df.copy()
+
+    # LOGIC — assign 1-based row numbers reflecting source file position
+    working["row_number"] = range(1, len(working) + 1)
+
+    valid_rows = []
+    rejected_rows = []
+
+    for _, row in working.iterrows():
+        row_dict = row.to_dict()
+        rejection_reason = _check_row(row_dict, desk_code)
+
+        if rejection_reason is not None:
+            row_dict["rejection_reason"] = rejection_reason
+            rejected_rows.append(row_dict)
+        else:
+            valid_rows.append(row_dict)
+
+    # LOGIC — build rejected DataFrame
+    if rejected_rows:
+        rejected_df = pd.DataFrame(rejected_rows)
+        # Ensure rejection_reason column is present and typed as str
+        rejected_df["rejection_reason"] = rejected_df["rejection_reason"].astype(str)
+    else:
+        # LOGIC — empty rejected DataFrame preserves column schema
+        rejected_columns = list(working.columns) + ["rejection_reason"]
+        rejected_df = pd.DataFrame(columns=rejected_columns)
+
+    # LOGIC — build valid DataFrame with coerced types
+    if valid_rows:
+        valid_df = pd.DataFrame(valid_rows)
+        valid_df = _coerce_valid_types(valid_df)
+    else:
+        # LOGIC — empty valid DataFrame preserves column schema
+        valid_df = pd.DataFrame(columns=list(working.columns))
+
+    logger.info(
+        "Validation complete — valid=%d, rejected=%d",
+        len(valid_df),
+        len(rejected_df),
+    )
+    if len(rejected_df) > 0:
+        logger.warning(
+            "%d row(s) rejected; first reason: %s",
+            len(rejected_df),
+            rejected_df["rejection_reason"].iloc[0],
+        )
+
+    return valid_df, rejected_df
+
+
+def _check_row(row_dict: dict, filename_desk_code: str) -> str | None:
+    """
+    Applies validation checks in order.
+    Returns the rejection_reason string, or None if the row is valid.
+    """
+    # LOGIC — Check 1: missing mandatory fields (first failing field wins)
     for field in MANDATORY_FIELDS:
-        if field not in row.index or _is_blank(row.get(field)):
+        value = row_dict.get(field)
+        if _is_blank(value):
             return f"MISSING_FIELD:{field}"
 
-    # V-02: trade_id must be a non-empty string with no whitespace-only content
-    trade_id = row["trade_id"]
-    if not isinstance(trade_id, str) or trade_id.strip() == "":
-        return "INVALID_TRADE_ID"
+    # LOGIC — Check 2: trade_date format must be YYYY-MM-DD
+    trade_date_value = row_dict.get("trade_date", "")
+    if not _try_cast_date(trade_date_value):
+        return "INVALID_DATE_FORMAT:trade_date"
 
-    # V-03: trade_date must be parseable as YYYY-MM-DD and match the filename date
-    trade_date_val = row["trade_date"]
-    if not isinstance(trade_date_val, str):
-        trade_date_val = str(trade_date_val)
-    trade_date_val = trade_date_val.strip()
-    try:
-        datetime.strptime(trade_date_val, _DATE_FORMAT)
-    except ValueError:
-        return "INVALID_TRADE_DATE"
-    if trade_date_val != trade_date_from_filename:
-        return "INVALID_TRADE_DATE"
+    # LOGIC — Check 3: notional_amount must be castable to float
+    notional_value = row_dict.get("notional_amount", "")
+    if not _try_cast_float(notional_value):
+        return "INVALID_NUMERIC:notional_amount"
 
-    # V-04: desk_code in the row must match the desk_code parsed from the filename
-    desk_code_val = row["desk_code"]
-    if not isinstance(desk_code_val, str) or desk_code_val.strip() != desk_code_from_filename:
+    # LOGIC — Check 4: desk_code in row must match filename-extracted desk_code
+    row_desk_code = str(row_dict.get("desk_code", "")).strip()
+    if row_desk_code != filename_desk_code:
         return "DESK_CODE_MISMATCH"
-
-    # V-05: notional_amount must be parseable as float and non-negative
-    notional_raw = row["notional_amount"]
-    try:
-        notional_float = float(notional_raw)
-    except (ValueError, TypeError):
-        return "INVALID_NOTIONAL_AMOUNT"
-    if pd.isna(notional_float) or notional_float < 0:
-        return "INVALID_NOTIONAL_AMOUNT"
-
-    # V-06: currency must be exactly 3 uppercase alphabetic characters (ISO 4217 shape)
-    currency_val = row["currency"]
-    if not isinstance(currency_val, str) or not _CURRENCY_RE.match(currency_val.strip()):
-        return "INVALID_CURRENCY"
-
-    # V-07: counterparty_id must be a non-empty string
-    cp_val = row["counterparty_id"]
-    if _is_blank(cp_val):
-        return "MISSING_COUNTERPARTY_ID"
 
     return None
 
 
-def validate_rows(
-    df: pd.DataFrame,
-    desk_code_from_filename: str,
-    trade_date_from_filename: str,
-) -> tuple:
-    # LOGIC — apply _check_row to every row; split into valid and rejected DataFrames
+def _coerce_valid_types(valid_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coerces columns on the valid DataFrame:
+      - notional_amount -> float
+      - trade_date      -> datetime.date
+    All other columns remain as-is.
+    """
+    # LOGIC — cast notional_amount to float
+    valid_df = valid_df.copy()
+    valid_df["notional_amount"] = valid_df["notional_amount"].str.strip().astype(float)
 
-    if df.empty:
-        logger.warning("validate_rows received an empty DataFrame")
-        valid_df = df.copy()
-        rejected_df = df.copy()
-        rejected_df["rejection_reason"] = pd.Series(dtype=str)
-        return valid_df, rejected_df
+    # LOGIC — cast trade_date string to datetime.date objects
+    valid_df["trade_date"] = pd.to_datetime(
+        valid_df["trade_date"].str.strip(), format=_TRADE_DATE_FORMAT
+    ).dt.date
 
-    # LOGIC — compute rejection reason for every row; None means the row is valid
-    rejection_reasons = df.apply(
-        lambda row: _check_row(row, desk_code_from_filename, trade_date_from_filename),
-        axis=1,
-    )
-
-    # LOGIC — split by whether a rejection reason was produced
-    rejected_mask = rejection_reasons.notna()
-    valid_mask = ~rejected_mask
-
-    valid_df = df[valid_mask].copy()
-    # LOGIC — valid_df must not carry a rejection_reason column
-    if "rejection_reason" in valid_df.columns:
-        valid_df = valid_df.drop(columns=["rejection_reason"])
-
-    rejected_df = df[rejected_mask].copy()
-    rejected_df["rejection_reason"] = rejection_reasons[rejected_mask]
-
-    logger.info(
-        "validate_rows: total=%d valid=%d rejected=%d",
-        len(df),
-        len(valid_df),
-        len(rejected_df),
-    )
-
-    return valid_df, rejected_df
+    return valid_df
