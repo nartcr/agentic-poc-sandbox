@@ -1,83 +1,91 @@
+# BOILERPLATE
 import json
 import logging
+from dataclasses import dataclass
+from typing import Any, Dict
+
 import boto3
 
-# BOILERPLATE
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-# LOGIC — module-level cache keyed by secret_id to avoid redundant API calls
-# within the same Lambda invocation
-_cache: dict = {}
-
-_REQUIRED_KEYS = {"host", "port", "dbname", "username", "password"}
+# LOGIC — in-process cache to avoid redundant Secrets Manager round-trips per Lambda invocation
+_secret_cache: Dict[str, Any] = {}
 
 
-def get_db_credentials(secret_id: str) -> dict:
-    # LOGIC — return cached credentials if already retrieved this invocation
-    if secret_id in _cache:
-        logger.info("Returning cached DB credentials for secret_id=%s", secret_id)
-        return _cache[secret_id]
+@dataclass(frozen=True)
+class DbCredentials:
+    # LOGIC — typed DB credential fields matching the DATA CONTRACTS secret JSON keys exactly
+    host: str
+    port: int
+    dbname: str
+    username: str
+    password: str
 
-    logger.info("Retrieving DB credentials from Secrets Manager. secret_id=%s", secret_id)
 
-    # BOILERPLATE — create Secrets Manager client at call time (no hardcoded credentials)
+@dataclass(frozen=True)
+class AppConfig:
+    # LOGIC — reserved application-level config from Secrets Manager (no required fields currently)
+    raw: Dict[str, Any]
+
+
+def _get_secret_json(secret_id: str) -> Dict[str, Any]:
+    # LOGIC — retrieves and parses secret JSON from Secrets Manager; caches result in-process
+    if secret_id in _secret_cache:
+        logger.debug("Returning cached secret for secret_id=%s", secret_id)
+        return _secret_cache[secret_id]
+
+    logger.debug("Retrieving secret from Secrets Manager: secret_id=%s", secret_id)
+    # BOILERPLATE — client created inside function to avoid credential issues at import time
     client = boto3.client("secretsmanager")
+    response = client.get_secret_value(SecretId=secret_id)
 
-    try:
-        response = client.get_secret_value(SecretId=secret_id)
-    except Exception as exc:
-        logger.error(
-            "Failed to retrieve secret from Secrets Manager. secret_id=%s error=%s",
-            secret_id,
-            str(exc),
-        )
-        raise RuntimeError(
-            f"Unable to retrieve secret '{secret_id}' from Secrets Manager: {exc}"
-        ) from exc
+    # LOGIC — secret may be stored as SecretString (JSON text) or SecretBinary
+    if "SecretString" in response:
+        secret_text = response["SecretString"]
+    else:
+        # LOGIC — SecretBinary is base64-decoded bytes; decode to UTF-8 string before JSON parse
+        secret_text = response["SecretBinary"].decode("utf-8")
 
-    # LOGIC — parse the secret string as JSON
-    secret_string = response.get("SecretString")
-    if not secret_string:
-        raise RuntimeError(
-            f"Secret '{secret_id}' exists but SecretString is empty or missing."
-        )
+    parsed: Dict[str, Any] = json.loads(secret_text)
+    _secret_cache[secret_id] = parsed
+    logger.debug("Secret retrieved and cached: secret_id=%s keys=%s", secret_id, list(parsed.keys()))
+    return parsed
 
-    try:
-        secret_dict = json.loads(secret_string)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"Secret '{secret_id}' SecretString is not valid JSON: {exc}"
-        ) from exc
 
-    # LOGIC — validate all required keys are present
-    missing_keys = _REQUIRED_KEYS - set(secret_dict.keys())
-    if missing_keys:
-        raise RuntimeError(
-            f"Secret '{secret_id}' is missing required keys: {sorted(missing_keys)}"
+def get_db_credentials(secret_id: str) -> DbCredentials:
+    # LOGIC — retrieves DB credentials and constructs typed dataclass; port cast to int because
+    # Secrets Manager JSON values for numeric fields may be stored as strings
+    parsed = _get_secret_json(secret_id)
+
+    missing = [k for k in ("host", "port", "dbname", "username", "password") if k not in parsed]
+    if missing:
+        raise KeyError(
+            f"DB credentials secret '{secret_id}' is missing required keys: {missing}"
         )
 
-    # LOGIC — cast port to int per data contract return type
-    try:
-        credentials = {
-            "host": str(secret_dict["host"]),
-            "port": int(secret_dict["port"]),
-            "dbname": str(secret_dict["dbname"]),
-            "username": str(secret_dict["username"]),
-            "password": str(secret_dict["password"]),
-        }
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError(
-            f"Secret '{secret_id}' contains invalid value types: {exc}"
-        ) from exc
-
-    # LOGIC — store in module-level cache before returning
-    _cache[secret_id] = credentials
-    logger.info(
-        "DB credentials retrieved and cached. secret_id=%s host=%s dbname=%s",
-        secret_id,
-        credentials["host"],
-        credentials["dbname"],
+    credentials = DbCredentials(
+        host=str(parsed["host"]),
+        port=int(parsed["port"]),
+        dbname=str(parsed["dbname"]),
+        username=str(parsed["username"]),
+        password=str(parsed["password"]),
     )
-
+    logger.debug(
+        "DbCredentials constructed: host=%s port=%d dbname=%s username=%s",
+        credentials.host,
+        credentials.port,
+        credentials.dbname,
+        credentials.username,
+    )
     return credentials
+
+
+def get_app_config(secret_id: str) -> AppConfig:
+    # LOGIC — retrieves application-level config secret; returns typed AppConfig wrapping raw dict.
+    # Secret may be an empty object {} if not yet populated (reserved for future use per design).
+    parsed = _get_secret_json(secret_id)
+    app_cfg = AppConfig(raw=parsed)
+    logger.debug(
+        "AppConfig constructed from secret_id=%s: keys=%s", secret_id, list(parsed.keys())
+    )
+    return app_cfg

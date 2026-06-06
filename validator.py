@@ -1,15 +1,13 @@
 # BOILERPLATE
 import logging
-import re
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# LOGIC — ordered list of mandatory columns used for null-rate checks and validation
-MANDATORY_COLUMNS = [
+# LOGIC — all mandatory fields per data contract
+_MANDATORY_FIELDS = [
     "trade_id",
     "desk_code",
     "trade_date",
@@ -20,120 +18,143 @@ MANDATORY_COLUMNS = [
 ]
 
 
-def _is_null_or_empty(value) -> bool:
-    # LOGIC — treats pandas NaN, None, and whitespace-only strings as missing
-    if pd.isna(value):
-        return True
-    if isinstance(value, str) and value.strip() == "":
-        return True
-    return False
+def _check_mandatory_fields(row: pd.Series) -> list[str]:
+    # LOGIC — a field fails if it is absent from the row, None/NaN, or empty string
+    reasons: list[str] = []
+    for field in _MANDATORY_FIELDS:
+        value = row.get(field, None)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            reasons.append(f"Missing mandatory field: {field}")
+        elif isinstance(value, str) and value.strip() == "":
+            reasons.append(f"Missing mandatory field: {field}")
+    return reasons
 
 
-def _validate_trade_id(value) -> str | None:
-    # LOGIC
-    if _is_null_or_empty(value):
-        return "trade_id is missing"
-    return None
+def _check_trade_date_consistency(
+    row: pd.Series, expected_trade_date: str
+) -> list[str]:
+    # LOGIC — trade_date column value must match trade_date from the filename
+    reasons: list[str] = []
+    row_trade_date = row.get("trade_date", None)
+    if row_trade_date is not None and not (
+        isinstance(row_trade_date, float) and pd.isna(row_trade_date)
+    ):
+        if str(row_trade_date).strip() != expected_trade_date:
+            reasons.append(
+                f"trade_date mismatch: file states {expected_trade_date}, "
+                f"row contains {row_trade_date}"
+            )
+    # LOGIC — if trade_date is null/empty it was already caught by mandatory-field check;
+    # we do not double-report the consistency failure in that case
+    return reasons
 
 
-def _validate_desk_code(value) -> str | None:
-    # LOGIC
-    if _is_null_or_empty(value):
-        return "desk_code is missing"
-    return None
+def _check_notional_amount(row: pd.Series) -> list[str]:
+    # LOGIC — notional_amount must be castable to Decimal and must be >= 0
+    reasons: list[str] = []
+    raw_value = row.get("notional_amount", None)
 
+    # LOGIC — null / empty already caught by mandatory-field check; skip here
+    if raw_value is None or (isinstance(raw_value, float) and pd.isna(raw_value)):
+        return reasons
+    if isinstance(raw_value, str) and raw_value.strip() == "":
+        return reasons
 
-def _validate_trade_date(value) -> str | None:
-    # LOGIC — checks not null, matches YYYY-MM-DD pattern, then verifiable calendar date
-    if _is_null_or_empty(value):
-        return "trade_date is missing"
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value).strip()):
-        return "trade_date does not match format YYYY-MM-DD"
     try:
-        datetime.strptime(str(value).strip(), "%Y-%m-%d")
-    except ValueError:
-        return "trade_date is not a valid calendar date"
-    return None
-
-
-def _validate_instrument_type(value) -> str | None:
-    # LOGIC
-    if _is_null_or_empty(value):
-        return "instrument_type is missing"
-    return None
-
-
-def _validate_notional_amount(value) -> str | None:
-    # LOGIC — must be castable to Decimal; rejects non-numeric characters
-    if _is_null_or_empty(value):
-        return "notional_amount is missing"
-    try:
-        Decimal(str(value).strip())
+        amount = Decimal(str(raw_value).strip())
     except InvalidOperation:
-        return "notional_amount is not a valid decimal"
-    return None
+        reasons.append(
+            f"notional_amount is not a valid non-negative number: {raw_value}"
+        )
+        return reasons
+
+    if amount < Decimal("0"):
+        reasons.append(
+            f"notional_amount is not a valid non-negative number: {raw_value}"
+        )
+    return reasons
 
 
-def _validate_currency(value) -> str | None:
-    # LOGIC — must be exactly 3 alphabetic characters (ISO 4217)
-    if _is_null_or_empty(value):
-        return "currency is missing"
-    if not re.fullmatch(r"[A-Za-z]{3}", str(value).strip()):
-        return "currency must be exactly 3 alphabetic characters"
-    return None
+def validate_rows(
+    df: pd.DataFrame, desk_code: str, trade_date: str
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # LOGIC — pre-compute duplicate trade_ids across the entire file so that
+    # all occurrences (including the first) are flagged, not just the second+
+    trade_id_col = df["trade_id"] if "trade_id" in df.columns else pd.Series([], dtype=object)
 
+    # LOGIC — find trade_ids that appear more than once; .duplicated(keep=False)
+    # marks ALL rows of a duplicated value as True
+    if "trade_id" in df.columns:
+        duplicate_mask = df["trade_id"].duplicated(keep=False)
+        duplicate_trade_ids: set[str] = set(
+            df.loc[duplicate_mask, "trade_id"].dropna().astype(str).tolist()
+        )
+    else:
+        duplicate_trade_ids = set()
 
-def _validate_counterparty_id(value) -> str | None:
-    # LOGIC
-    if _is_null_or_empty(value):
-        return "counterparty_id is missing"
-    return None
+    valid_rows: list[dict] = []
+    rejected_rows: list[dict] = []
 
+    for _, row in df.iterrows():
+        all_reasons: list[str] = []
 
-# LOGIC — maps each column to its validator function, in the order specified by the design
-_VALIDATORS = [
-    ("trade_id", _validate_trade_id),
-    ("desk_code", _validate_desk_code),
-    ("trade_date", _validate_trade_date),
-    ("instrument_type", _validate_instrument_type),
-    ("notional_amount", _validate_notional_amount),
-    ("currency", _validate_currency),
-    ("counterparty_id", _validate_counterparty_id),
-]
+        # LOGIC — Rule 1: mandatory field presence
+        all_reasons.extend(_check_mandatory_fields(row))
 
+        # LOGIC — Rule 2: desk_code consistency (column vs filename)
+        row_desk_code = row.get("desk_code", None)
+        if row_desk_code is not None and not (
+            isinstance(row_desk_code, float) and pd.isna(row_desk_code)
+        ):
+            if str(row_desk_code).strip() != desk_code:
+                all_reasons.append(
+                    f"desk_code mismatch: file states {desk_code}, "
+                    f"row contains {row_desk_code}"
+                )
 
-def _validate_row(row: pd.Series) -> str | None:
-    # LOGIC — applies all validators to a single row, accumulates all failure reasons
-    reasons = []
-    for col, validator_fn in _VALIDATORS:
-        value = row.get(col)
-        result = validator_fn(value)
-        if result is not None:
-            reasons.append(result)
-    if reasons:
-        return " | ".join(reasons)
-    return None
+        # LOGIC — Rule 3: trade_date consistency (column vs filename)
+        all_reasons.extend(_check_trade_date_consistency(row, trade_date))
 
+        # LOGIC — Rule 4: notional_amount format and non-negative check
+        all_reasons.extend(_check_notional_amount(row))
 
-def validate(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # LOGIC — entry point: applies row-level validation, splits into valid and rejected sets
-    logger.info("Starting validation on %d rows", len(df))
+        # LOGIC — Rule 5: duplicate trade_id within this file
+        row_trade_id = row.get("trade_id", None)
+        if row_trade_id is not None and not (
+            isinstance(row_trade_id, float) and pd.isna(row_trade_id)
+        ):
+            if str(row_trade_id).strip() in duplicate_trade_ids:
+                all_reasons.append(
+                    f"Duplicate trade_id within file: {row_trade_id}"
+                )
 
-    # LOGIC — apply _validate_row across all rows; result is a Series of reason strings or None
-    rejection_reasons = df.apply(_validate_row, axis=1)
+        row_dict = row.to_dict()
 
-    # LOGIC — boolean mask: True where row is valid (no rejection reason)
-    valid_mask = rejection_reasons.isna()
+        if all_reasons:
+            # LOGIC — rejected row: append all failure reasons as semicolon-delimited string
+            row_dict["rejection_reason"] = "; ".join(all_reasons)
+            rejected_rows.append(row_dict)
+        else:
+            valid_rows.append(row_dict)
 
-    valid_df = df.loc[valid_mask].copy().reset_index(drop=True)
+    # BOILERPLATE — reconstruct DataFrames from collected rows
+    if valid_rows:
+        valid_df = pd.DataFrame(valid_rows, columns=list(df.columns))
+    else:
+        valid_df = pd.DataFrame(columns=list(df.columns))
 
-    rejected_df = df.loc[~valid_mask].copy()
-    rejected_df = rejected_df.reset_index(drop=True)
-    # LOGIC — append rejection_reason as the final column on the rejected set
-    rejected_df["rejection_reason"] = rejection_reasons.loc[~valid_mask].values
+    if rejected_rows:
+        rejected_columns = list(df.columns) + ["rejection_reason"]
+        rejected_df = pd.DataFrame(rejected_rows, columns=rejected_columns)
+    else:
+        rejected_df = pd.DataFrame(columns=list(df.columns) + ["rejection_reason"])
 
     logger.info(
-        "Validation complete: %d valid rows, %d rejected rows",
+        "Validation complete: desk_code=%s trade_date=%s "
+        "total=%d valid=%d rejected=%d",
+        desk_code,
+        trade_date,
+        len(df),
         len(valid_df),
         len(rejected_df),
     )
