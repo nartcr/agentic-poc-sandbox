@@ -1,53 +1,73 @@
+# BOILERPLATE
 import os
-import pytz
+import logging
 from dataclasses import dataclass
 
-# BOILERPLATE — timezone constant used across the pipeline
-TIMEZONE = pytz.timezone("America/Toronto")
-
-# LOGIC — S3 prefix constants matching the data contract
-INPUT_PREFIX = "incoming/"
-ERROR_PREFIX = "errors/"
-REPORT_PREFIX = "reports/"
-
-# LOGIC — fully-qualified table names as specified in the data contract
-POSITIONS_TABLE = "demo_schema.trade_positions"
-AUDIT_TABLE = "demo_schema.pipeline_audit"
-
-# LOGIC — mandatory CSV columns that must be present and non-empty for every row
-MANDATORY_FIELDS = [
-    "trade_id",
-    "desk_code",
-    "trade_date",
-    "instrument_type",
-    "notional_amount",
-    "currency",
-    "counterparty_id",
-]
+logger = logging.getLogger(__name__)
 
 
-@dataclass
+# LOGIC
+@dataclass(frozen=True)
 class Config:
-    # LOGIC — all runtime configuration sourced from environment variables
-    db_secret_id: str
-    s3_bucket: str
-    sns_success_arn: str
-    sns_failure_arn: str
-    db_schema: str
-    db_name: str
+    """Typed, immutable configuration derived entirely from environment variables."""
+    S3_BUCKET: str
+    S3_INPUT_PREFIX: str
+    S3_ERROR_PREFIX: str
+    S3_REPORT_PREFIX: str
+    DB_SECRET_ID: str
+    SNS_SUCCESS_ARN: str
+    SNS_FAILURE_ARN: str
+    AWS_REGION: str
 
 
+# LOGIC — read and validate all required env vars at module import time
 def _load_config() -> Config:
-    # LOGIC — reads every required env var; raises KeyError with the variable name if absent
-    return Config(
-        db_secret_id=os.environ["DB_SECRET_ID"],
-        s3_bucket=os.environ["S3_BUCKET"],
-        sns_success_arn=os.environ["SNS_SUCCESS_ARN"],
-        sns_failure_arn=os.environ["SNS_FAILURE_ARN"],
-        db_schema=os.environ.get("DB_SCHEMA", "demo_schema"),
-        db_name=os.environ.get("DB_NAME", "app"),
+    """
+    Read every required environment variable.
+    Raises EnvironmentError listing ALL missing variables so operators can fix
+    everything in one deployment cycle.
+    """
+    required_vars = [
+        "S3_BUCKET",
+        "S3_INPUT_PREFIX",
+        "S3_ERROR_PREFIX",
+        "S3_REPORT_PREFIX",
+        "DB_SECRET_ID",
+        "SNS_SUCCESS_ARN",
+        "SNS_FAILURE_ARN",
+        "AWS_REGION",
+    ]
+
+    missing = [var for var in required_vars if not os.environ.get(var)]
+
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variable(s): {', '.join(missing)}"
+        )
+
+    cfg = Config(
+        S3_BUCKET=os.environ["S3_BUCKET"],
+        S3_INPUT_PREFIX=os.environ["S3_INPUT_PREFIX"],
+        S3_ERROR_PREFIX=os.environ["S3_ERROR_PREFIX"],
+        S3_REPORT_PREFIX=os.environ["S3_REPORT_PREFIX"],
+        DB_SECRET_ID=os.environ["DB_SECRET_ID"],
+        SNS_SUCCESS_ARN=os.environ["SNS_SUCCESS_ARN"],
+        SNS_FAILURE_ARN=os.environ["SNS_FAILURE_ARN"],
+        AWS_REGION=os.environ["AWS_REGION"],
     )
 
+    logger.info(
+        "Configuration loaded: bucket=%s input_prefix=%s error_prefix=%s "
+        "report_prefix=%s region=%s",
+        cfg.S3_BUCKET,
+        cfg.S3_INPUT_PREFIX,
+        cfg.S3_ERROR_PREFIX,
+        cfg.S3_REPORT_PREFIX,
+        cfg.AWS_REGION,
+    )
 
-# BOILERPLATE — module-level singleton; populated once at import time
-cfg: Config = _load_config()
+    return cfg
+
+
+# BOILERPLATE — module-level singleton; imported by all other modules
+config: Config = _load_config()

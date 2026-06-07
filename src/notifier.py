@@ -3,90 +3,85 @@ import json
 import logging
 from datetime import datetime
 
-import boto3
 import pytz
 
-from src.config import TIMEZONE
-
-# BOILERPLATE
 logger = logging.getLogger(__name__)
 
 
-def _now_et_iso() -> str:
-    # LOGIC — always produce an ET-aware ISO-8601 timestamp at call time
-    return datetime.now(tz=TIMEZONE).isoformat()
+class _PayloadEncoder(json.JSONEncoder):
+    """Custom JSON encoder for datetime objects in SNS payloads."""  # BOILERPLATE
+
+    def default(self, obj):  # LOGIC
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
 
-def _derive_report_key(source_file: str) -> str:
-    # LOGIC — reconstruct reports/{desk_code}_{trade_date}_report.json
-    # from the source file path incoming/{desk_code}_{trade_date}_positions.csv
-    filename = source_file.split("/")[-1]                 # e.g. EQDSK_2026-06-15_positions.csv
-    stem = filename.replace("_positions.csv", "")         # e.g. EQDSK_2026-06-15
-    return f"reports/{stem}_report.json"
+def notify_success(sns_client, topic_arn: str, summary: dict) -> None:
+    """
+    Publish a POSITION_LOAD_SUCCESS message to the success SNS topic.
+    summary is the dict returned by reporter.build_summary.
+    Does not mutate the input summary dict.
+    """  # LOGIC
 
+    payload = dict(summary)
+    payload["event"] = "POSITION_LOAD_SUCCESS"
 
-def notify_success(report: dict, sns_success_arn: str) -> None:
-    # LOGIC — build the mandated success message payload
-    message_body = {
-        "event": "TRADE_POSITIONS_LOADED",
-        "source_file": report.get("source_file", ""),
-        "processing_timestamp": report.get("processing_timestamp", _now_et_iso()),
-        "total_rows_received": report.get("total_rows_received", 0),
-        "rows_loaded": report.get("rows_loaded", 0),
-        "rows_rejected": report.get("rows_rejected", 0),
-        "report_s3_key": _derive_report_key(report.get("source_file", "")),
-    }
+    message_body = json.dumps(payload, cls=_PayloadEncoder)
 
-    try:
-        # BOILERPLATE — fresh client per call; no module-level client
-        sns = boto3.client("sns")
-        sns.publish(
-            TopicArn=sns_success_arn,
-            Message=json.dumps(message_body),
-            Subject="TRADE_POSITIONS_LOADED",
-        )
-        logger.info(
-            "Success notification published: source_file=%s topic=%s",
-            message_body["source_file"],
-            sns_success_arn,
-        )
-    except Exception as exc:  # LOGIC — never raise; log and return
-        logger.error(
-            "Failed to publish success notification to %s: %s",
-            sns_success_arn,
-            exc,
-        )
+    logger.info(
+        "Publishing success notification to %s for desk_code=%s trade_date=%s",
+        topic_arn,
+        summary.get("desk_code"),
+        summary.get("trade_date"),
+    )
+
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Message=message_body,
+    )
+
+    logger.info("Success notification published.")
 
 
 def notify_failure(
-    source_key: str,
-    error_message: str,
-    sns_failure_arn: str,
+    sns_client,
+    topic_arn: str,
+    desk_code: str,
+    trade_date: str,
+    s3_key: str,
+    error_detail: str,
 ) -> None:
-    # LOGIC — build the mandated failure message payload
-    message_body = {
-        "event": "TRADE_POSITIONS_FAILED",
-        "source_file": source_key,
-        "processing_timestamp": _now_et_iso(),
-        "error_message": error_message,
+    """
+    Publish a POSITION_LOAD_FAILURE message to the failure SNS topic.
+    Stamps failure_timestamp_et at call time using ET timezone.
+    """  # LOGIC
+
+    et_tz = pytz.timezone("America/Toronto")  # BOILERPLATE
+    failure_ts = datetime.now(et_tz)
+
+    payload = {
+        "event": "POSITION_LOAD_FAILURE",
+        "desk_code": desk_code,
+        "trade_date": trade_date,
+        "s3_key": s3_key,
+        "error_detail": error_detail,
+        "failure_timestamp_et": failure_ts.isoformat(),
     }
 
-    try:
-        # BOILERPLATE — fresh client per call
-        sns = boto3.client("sns")
-        sns.publish(
-            TopicArn=sns_failure_arn,
-            Message=json.dumps(message_body),
-            Subject="TRADE_POSITIONS_FAILED",
-        )
-        logger.info(
-            "Failure notification published: source_file=%s topic=%s",
-            source_key,
-            sns_failure_arn,
-        )
-    except Exception as exc:  # LOGIC — never raise; log and return
-        logger.error(
-            "Failed to publish failure notification to %s: %s",
-            sns_failure_arn,
-            exc,
-        )
+    message_body = json.dumps(payload, cls=_PayloadEncoder)
+
+    logger.info(
+        "Publishing failure notification to %s for desk_code=%s trade_date=%s s3_key=%s",
+        topic_arn,
+        desk_code,
+        trade_date,
+        s3_key,
+    )
+
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Message=message_body,
+    )
+
+    logger.info("Failure notification published.")

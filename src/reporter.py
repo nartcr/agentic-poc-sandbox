@@ -1,25 +1,14 @@
 # BOILERPLATE
-import io
 import json
 import logging
-import os
-import re
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 import pytz
 
-from src.s3_client import upload_bytes
-
 logger = logging.getLogger(__name__)
 
-# LOGIC
-_ET = pytz.timezone("America/Toronto")
-_FILENAME_RE = re.compile(
-    r"^(?:.*/)?([A-Z0-9]+)_(\d{4}-\d{2}-\d{2})_positions\.csv$"
-)
-
-# Columns for which null rates are computed (full input DataFrame columns per data contract)
+# BOILERPLATE — columns used for null-rate calculation (matches data contract)
 _NULL_RATE_COLUMNS = [
     "trade_id",
     "desk_code",
@@ -30,110 +19,124 @@ _NULL_RATE_COLUMNS = [
     "counterparty_id",
 ]
 
-_REPORT_PREFIX = "reports/"
+
+class _SummaryEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles date/datetime objects."""  # BOILERPLATE
+
+    def default(self, obj):  # LOGIC
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, date):
+            return obj.isoformat()
+        return super().default(obj)
 
 
-def _parse_desk_and_date_from_key(source_key: str):
-    # LOGIC — extract desk_code and trade_date from S3 key filename component
-    match = _FILENAME_RE.match(source_key)
-    if not match:
-        raise ValueError(
-            f"Cannot derive desk_code/trade_date from source_key: {source_key!r}"
-        )
-    return match.group(1), match.group(2)
-
-
-def build_and_upload_report(
-    source_key: str,
-    total_rows: int,
-    loaded_rows: int,
-    rejected_rows: int,
+def build_summary(
+    raw_df: pd.DataFrame,
     valid_df: pd.DataFrame,
     rejected_df: pd.DataFrame,
-    processing_timestamp: datetime,
-    bucket: str,
+    rows_inserted: int,
+    desk_code: str,
+    trade_date: str,
+    processing_ts: datetime,
 ) -> dict:
-    # LOGIC — derive desk_code and trade_date for the S3 report key
-    desk_code, trade_date = _parse_desk_and_date_from_key(source_key)
+    """
+    Compute post-load summary statistics and return as a dict.
+    processing_ts must be timezone-aware ET.
+    """  # LOGIC
 
-    # LOGIC — ensure processing_timestamp carries ET timezone info
-    if processing_timestamp.tzinfo is None:
-        processing_timestamp = _ET.localize(processing_timestamp)
-    else:
-        processing_timestamp = processing_timestamp.astimezone(_ET)
+    total_rows_received = len(raw_df)
+    rows_loaded = rows_inserted
+    rows_rejected = len(rejected_df)
+    rows_skipped_duplicate = len(valid_df) - rows_inserted  # LOGIC
 
-    # LOGIC — rows_by_desk_code: count by desk_code in valid_df
-    if not valid_df.empty and "desk_code" in valid_df.columns:
-        rows_by_desk: dict = (
-            valid_df.groupby("desk_code")
-            .size()
-            .sort_index()
-            .to_dict()
-        )
-        # convert numpy int types to plain Python int for JSON serialisation
-        rows_by_desk = {k: int(v) for k, v in rows_by_desk.items()}
-    else:
-        rows_by_desk = {}
+    logger.info(
+        "Building summary: total=%d loaded=%d rejected=%d skipped=%d",
+        total_rows_received,
+        rows_loaded,
+        rows_rejected,
+        rows_skipped_duplicate,
+    )
 
-    # LOGIC — notional min/max from valid_df only
+    # LOGIC — notional stats from valid rows only
     if not valid_df.empty and "notional_amount" in valid_df.columns:
-        notional_series = pd.to_numeric(valid_df["notional_amount"], errors="coerce")
-        notional_min = float(notional_series.min()) if notional_series.notna().any() else None
-        notional_max = float(notional_series.max()) if notional_series.notna().any() else None
+        notional_series = valid_df["notional_amount"].astype(float)
+        notional_min = float(notional_series.min())
+        notional_max = float(notional_series.max())
     else:
         notional_min = None
         notional_max = None
 
-    # LOGIC — null_rates_by_column computed over the full input DataFrame
-    # Reconstruct full input by concatenating valid and rejected (minus rejection_reason)
-    valid_cols = valid_df[_NULL_RATE_COLUMNS] if not valid_df.empty else pd.DataFrame(columns=_NULL_RATE_COLUMNS)
-    if not rejected_df.empty:
-        rejected_cols = rejected_df[[c for c in _NULL_RATE_COLUMNS if c in rejected_df.columns]]
-        # ensure all expected columns present
-        for col in _NULL_RATE_COLUMNS:
-            if col not in rejected_cols.columns:
-                rejected_cols = rejected_cols.copy()
-                rejected_cols[col] = None
-        rejected_cols = rejected_cols[_NULL_RATE_COLUMNS]
-        full_df = pd.concat([valid_cols, rejected_cols], ignore_index=True)
+    # LOGIC — record counts by desk_code from raw_df
+    if "desk_code" in raw_df.columns and not raw_df.empty:
+        record_counts_by_desk_code = (
+            raw_df["desk_code"]
+            .value_counts()
+            .to_dict()
+        )
+        # Ensure keys are plain Python strings
+        record_counts_by_desk_code = {
+            str(k): int(v) for k, v in record_counts_by_desk_code.items()
+        }
     else:
-        full_df = valid_cols
+        record_counts_by_desk_code = {}
 
+    # LOGIC — null rates per column from raw_df, expressed as float [0.0, 1.0]
     null_rates: dict = {}
     for col in _NULL_RATE_COLUMNS:
-        if col in full_df.columns and len(full_df) > 0:
-            rate = float(full_df[col].isna().mean())
+        if col in raw_df.columns and total_rows_received > 0:
+            null_count = int(raw_df[col].isna().sum()) + int(
+                (raw_df[col].astype(str).str.strip() == "").sum()
+            )
+            null_rates[col] = round(null_count / total_rows_received, 6)
+        elif total_rows_received == 0:
+            null_rates[col] = 0.0
         else:
-            rate = 0.0
-        null_rates[col] = round(rate, 6)
+            # Column absent from raw_df — treat all rows as null
+            null_rates[col] = 1.0
 
-    # LOGIC — assemble report dict matching the specified JSON structure
-    report = {
-        "source_file": source_key,
-        "processing_timestamp": processing_timestamp.isoformat(),
-        "total_rows_received": int(total_rows),
-        "rows_loaded": int(loaded_rows),
-        "rows_rejected": int(rejected_rows),
-        "rows_by_desk_code": rows_by_desk,
+    summary = {
+        "desk_code": desk_code,
+        "trade_date": trade_date,
+        "processing_timestamp_et": processing_ts.isoformat(),
+        "total_rows_received": total_rows_received,
+        "rows_loaded": rows_loaded,
+        "rows_rejected": rows_rejected,
+        "rows_skipped_duplicate": rows_skipped_duplicate,
+        "record_counts_by_desk_code": record_counts_by_desk_code,
         "notional_amount_min": notional_min,
         "notional_amount_max": notional_max,
-        "null_rates_by_column": null_rates,
+        "null_rates": null_rates,
     }
 
-    # LOGIC — upload JSON report to S3 under reports/ prefix
-    report_key = f"{_REPORT_PREFIX}{desk_code}_{trade_date}_report.json"
-    report_bytes = json.dumps(report, indent=2).encode("utf-8")
+    logger.debug("Summary built: %s", summary)
+    return summary
 
-    try:
-        upload_bytes(
-            bucket=bucket,
-            key=report_key,
-            data=report_bytes,
-            content_type="application/json",
-        )
-        logger.info("Report uploaded to s3://%s/%s", bucket, report_key)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to upload report to S3: %s", exc)
-        raise RuntimeError(f"Report upload failed for key {report_key}") from exc
 
-    return report
+def write_report(
+    s3_client,
+    bucket: str,
+    desk_code: str,
+    trade_date: str,
+    summary: dict,
+) -> str:
+    """
+    Serialise summary dict to UTF-8 JSON and upload to S3.
+    Returns the S3 key of the uploaded report.
+    """  # LOGIC
+
+    s3_key = f"reports/{desk_code}_{trade_date}_summary.json"
+
+    json_bytes = json.dumps(summary, cls=_SummaryEncoder, indent=2).encode("utf-8")
+
+    logger.info("Writing report to s3://%s/%s (%d bytes)", bucket, s3_key, len(json_bytes))
+
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=json_bytes,
+        ContentType="application/json",
+    )
+
+    logger.info("Report uploaded successfully: %s", s3_key)
+    return s3_key
